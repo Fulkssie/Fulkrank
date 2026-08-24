@@ -213,7 +213,7 @@ def add_data_to_dataset(sets, tournament_name):
 
 
 async def __main__():
-    file_path = "tournaments1.txt"
+    file_path = "tournamentsKnox.txt"
 
     if not os.path.exists(file_path):
         print(

@@ -1,289 +1,755 @@
+# =========================
+# IMPORTS
+# =========================
+
+from __future__ import annotations
+
 import argparse
 import csv
-from datetime import date
-
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+from datetime import date, datetime, timedelta, timezone
+from math import log
 
 
-def load_rankings(path):
+# =========================
+# GLOBALS
+# =========================
+
+MERGE_MAP = {1317379: 1278949, 4956095: 1152280, 4936088: 1029144, 328976: 2435358, 3599805: 2435358}
+
+BLACKLIST = [1962010]
+
+ACTIVITY_WINDOW_DAYS = 365
+
+BASELINE_K = 24.0
+BASELINE_K_PROVISIONAL = 40.0
+BASELINE_PROVISIONAL_MATCHES = 20
+BASELINE_HALF_LIFE = 0.0
+
+OPTIMIZED_K = 34.0
+OPTIMIZED_K_PROVISIONAL = 300.0
+OPTIMIZED_PROVISIONAL_MATCHES = 30
+OPTIMIZED_HALF_LIFE = 0.0
+
+
+# =========================
+# HELPERS
+# =========================
+
+def expected_score(rating_a: float, rating_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400.0))
+
+
+def new_record() -> dict[str, int]:
+    return {"wins": 0, "losses": 0, "matches": 0}
+
+
+def parse_date(raw: str) -> date:
+    return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
+def timestamp_to_date(raw: str) -> date:
+    return datetime.fromtimestamp(int(raw), tz=timezone.utc).date()
+
+
+def normalize_id(player_id: str) -> str:
+    numeric_id = int(player_id)
+    while numeric_id in MERGE_MAP:
+        numeric_id = MERGE_MAP[numeric_id]
+    return str(numeric_id)
+
+
+def recency_weight(match_date: date, as_of: date, half_life_days: float) -> float:
+    if half_life_days <= 0:
+        return 1.0
+
+    age_days = (as_of - match_date).days
+
+    if age_days <= 0:
+        return 1.0
+
+    return 0.5 ** (age_days / half_life_days)
+
+
+def k_factor(matches_played: int, k: float, k_provisional: float, provisional_matches: int) -> float:
+    if provisional_matches > 0 and matches_played < provisional_matches:
+        return k_provisional
+
+    return k
+
+
+def resolve_outcome(row: dict[str, str], player_1: str, player_2: str) -> tuple[str, str]:
+    score_1 = float(row["Player1Score"])
+    score_2 = float(row["Player2Score"])
+
+    if score_1 == score_2:
+        raise ValueError("Scores are tied.")
+
+    if score_1 > score_2:
+        return player_1, player_2
+
+    return player_2, player_1
+
+
+# =========================
+# DATA LOADING
+# =========================
+
+def load_matches(path: str) -> tuple[list[dict[str, str]], int]:
     with open(path, newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+        reader = csv.DictReader(handle)
+
+        required = {"Timestamp", "Player1ID", "Player1", "Player2ID", "Player2", "Player1Score", "Player2Score"}
+
+        missing = required - set(reader.fieldnames or [])
+
+        if missing:
+            raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
+
+        rows: list[dict[str, str]] = []
+        removed_blacklisted = 0
+
+        for row in reader:
+            if not row["Player1Score"].strip() or not row["Player2Score"].strip():
+                continue
+
+            score_1 = float(row["Player1Score"])
+            score_2 = float(row["Player2Score"])
+
+            if score_1 < 0 or score_2 < 0:
+                continue
+
+            id_1 = normalize_id(row["Player1ID"])
+            id_2 = normalize_id(row["Player2ID"])
+
+            if int(id_1) in BLACKLIST or int(id_2) in BLACKLIST:
+                removed_blacklisted += 1
+                continue
+
+            row["Player1ID"] = id_1
+            row["Player2ID"] = id_2
+
+            rows.append(row)
+
+    rows.sort(key=lambda row: int(row["Timestamp"]))
+
+    return rows, removed_blacklisted
 
 
-def make_graphic(rows, output, top_n=None):
-    if top_n is not None:
-        rows = rows[:top_n]
+# =========================
+# MATCH PROCESSING
+# =========================
+
+def apply_matches(
+    rows: list[dict[str, str]],
+    ratings: dict[str, float],
+    records: dict[str, dict[str, int]],
+    k: float,
+    base: float,
+    k_provisional: float,
+    provisional_matches: int,
+    half_life_days: float = 0.0,
+    as_of: date | None = None,
+    predictions: list[tuple[float, float, date, str, str]] | None = None,
+    names: dict[str, str] | None = None,
+) -> None:
 
     if not rows:
-        raise ValueError("No players found in rankings.csv.")
+        return
 
-    # Make the graphic tall enough for every player.
-    row_height = 0.0275
-    header_space = 0.20
-    footer_space = 0.08
-    height = header_space + (len(rows) * row_height) + footer_space
+    if as_of is None:
+        as_of = max(timestamp_to_date(row["Timestamp"]) for row in rows)
 
-    # Keep a reasonable minimum height.
-    height = max(height, 10.8)
+    for row in rows:
+        id_1 = row["Player1ID"]
+        id_2 = row["Player2ID"]
 
-    fig = plt.figure(figsize=(19.2, height), dpi=100)
-    ax = fig.add_axes([0, 0, 1, 1])
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
+        if names is not None:
+            names[id_1] = row["Player1"]
+            names[id_2] = row["Player2"]
 
-    # =========================
-    # HEADER
-    # =========================
+        winner, loser = resolve_outcome(row, id_1, id_2)
 
-    ax.text(
-        0.055, 0.97,
-        "FULKRANK",
-        fontsize=34,
-        fontweight="bold",
-        va="top",
+        ratings.setdefault(winner, base)
+        ratings.setdefault(loser, base)
+
+        records.setdefault(winner, new_record())
+        records.setdefault(loser, new_record())
+
+        if predictions is not None:
+            prediction = expected_score(ratings[id_1], ratings[id_2])
+            actual = 1.0 if winner == id_1 else 0.0
+            match_date = timestamp_to_date(row["Timestamp"])
+
+            predictions.append((prediction, actual, match_date, id_1, id_2))
+
+        match_date = timestamp_to_date(row["Timestamp"])
+        weight = recency_weight(match_date, as_of, half_life_days)
+
+        winner_k = k_factor(records[winner]["matches"], k, k_provisional, provisional_matches) * weight
+        loser_k = k_factor(records[loser]["matches"], k, k_provisional, provisional_matches) * weight
+
+        expected_winner = expected_score(ratings[winner], ratings[loser])
+
+        ratings[winner] += winner_k * (1.0 - expected_winner)
+        ratings[loser] -= loser_k * (1.0 - expected_winner)
+
+        records[winner]["matches"] += 1
+        records[winner]["wins"] += 1
+        records[loser]["matches"] += 1
+        records[loser]["losses"] += 1
+
+
+# =========================
+# ACTIVITY FILTER
+# =========================
+
+def eligible_player_ids(rows: list[dict[str, str]], as_of: date, activity_window_days: int = ACTIVITY_WINDOW_DAYS) -> set[str]:
+    cutoff = as_of - timedelta(days=activity_window_days)
+    eligible: set[str] = set()
+
+    for row in rows:
+        match_date = timestamp_to_date(row["Timestamp"])
+
+        if match_date >= cutoff:
+            eligible.add(row["Player1ID"])
+            eligible.add(row["Player2ID"])
+
+    return eligible
+
+
+def filter_eligible_predictions(
+    predictions: list[tuple[float, float, date, str, str]],
+    eligible_players: set[str],
+) -> list[tuple[float, float]]:
+
+    return [
+        (prediction, actual)
+        for prediction, actual, _, player_1, player_2 in predictions
+        if player_1 in eligible_players and player_2 in eligible_players
+    ]
+
+
+# =========================
+# METRICS
+# =========================
+
+def log_loss(predictions: list[tuple[float, float]], eps: float = 1e-15) -> float:
+    if not predictions:
+        return float("nan")
+
+    total = 0.0
+
+    for probability, actual in predictions:
+        probability = min(max(probability, eps), 1.0 - eps)
+        total += -(actual * log(probability) + (1.0 - actual) * log(1.0 - probability))
+
+    return total / len(predictions)
+
+
+def brier_score(predictions: list[tuple[float, float]]) -> float:
+    if not predictions:
+        return float("nan")
+
+    return sum((prediction - actual) ** 2 for prediction, actual in predictions) / len(predictions)
+
+
+def accuracy(predictions: list[tuple[float, float]]) -> float:
+    if not predictions:
+        return float("nan")
+
+    correct = sum(
+        1
+        for prediction, actual in predictions
+        if (prediction >= 0.5 and actual == 1.0) or (prediction < 0.5 and actual == 0.0)
     )
 
-    ax.text(
-        0.055, 0.935,
-        "Competitive Player Rankings",
-        fontsize=18,
-        va="top",
+    return correct / len(predictions)
+
+
+# =========================
+# EVALUATION
+# =========================
+
+def evaluate_params(
+    rows: list[dict[str, str]],
+    base: float,
+    k: float,
+    k_provisional: float,
+    provisional_matches: int,
+    half_life_days: float,
+    as_of: date,
+    warmup_rows: list[dict[str, str]] | None = None,
+) -> tuple[float, int, int]:
+
+    ratings: dict[str, float] = {}
+    records: dict[str, dict[str, int]] = {}
+
+    if warmup_rows:
+        apply_matches(
+            warmup_rows,
+            ratings,
+            records,
+            k,
+            base,
+            k_provisional,
+            provisional_matches,
+            half_life_days,
+            as_of,
+        )
+
+    predictions: list[tuple[float, float, date, str, str]] = []
+
+    apply_matches(
+        rows,
+        ratings,
+        records,
+        k,
+        base,
+        k_provisional,
+        provisional_matches,
+        half_life_days,
+        as_of,
+        predictions,
     )
 
-    ax.text(
-        0.945, 0.97,
-        date.today().strftime("%B %d, %Y"),
-        fontsize=14,
-        ha="right",
-        va="top",
+    eligible_players = eligible_player_ids(rows, as_of)
+    filtered_predictions = filter_eligible_predictions(predictions, eligible_players)
+
+    return log_loss(filtered_predictions), len(filtered_predictions), len(predictions)
+
+
+# =========================
+# SPLITTING
+# =========================
+
+def split_rows(rows: list[dict[str, str]], fraction: float) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    if not 0.0 < fraction < 1.0:
+        raise ValueError("Split must be between 0 and 1.")
+
+    cut = int(round(len(rows) * (1.0 - fraction)))
+    cut = max(1, min(cut, len(rows) - 1))
+
+    return rows[:cut], rows[cut:]
+
+
+def three_way_split(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    train_end = int(len(rows) * 0.70)
+    validation_end = int(len(rows) * 0.85)
+
+    train_rows = rows[:train_end]
+    validation_rows = rows[train_end:validation_end]
+    test_rows = rows[validation_end:]
+
+    return train_rows, validation_rows, test_rows
+
+
+# =========================
+# PARAMETER GRID
+# =========================
+
+def parse_grid(spec: str | None, default: list[float]) -> list[float]:
+    if not spec:
+        return default
+
+    values = []
+
+    for token in spec.split(","):
+        token = token.strip()
+
+        if token:
+            values.append(float(token))
+
+    return values or default
+
+
+# =========================
+# OPTIMIZATION
+# =========================
+
+def optimize(
+    rows: list[dict[str, str]],
+    base: float,
+    k_grid: list[float],
+    k_provisional_grid: list[float],
+    provisional_matches_grid: list[float],
+    half_life_grid: list[float],
+    as_of: date,
+    split: float,
+) -> None:
+
+    train_rows, validation_rows = split_rows(rows, split)
+
+    total = len(k_grid) * len(k_provisional_grid) * len(provisional_matches_grid) * len(half_life_grid)
+
+    print()
+    print(f"Testing {total:,} parameter combinations...")
+    print(f"Training matches:   {len(train_rows):,}")
+    print(f"Validation matches: {len(validation_rows):,}")
+    print(f"Activity window:    {ACTIVITY_WINDOW_DAYS} days")
+
+    baseline_loss, baseline_eligible, baseline_total = evaluate_params(
+        validation_rows,
+        base,
+        BASELINE_K,
+        BASELINE_K_PROVISIONAL,
+        BASELINE_PROVISIONAL_MATCHES,
+        BASELINE_HALF_LIFE,
+        as_of,
+        train_rows,
     )
 
-    ax.text(
-        0.945, 0.935,
-        f"{len(rows):,} players",
-        fontsize=13,
-        ha="right",
-        va="top",
+    print()
+    print("Baseline:")
+    print(f"K                 = {BASELINE_K:g}")
+    print(f"K-provisional     = {BASELINE_K_PROVISIONAL:g}")
+    print(f"Provisional match = {BASELINE_PROVISIONAL_MATCHES}")
+    print(f"Half-life         = {BASELINE_HALF_LIFE:g}")
+    print(f"Eligible matches  = {baseline_eligible:,} / {baseline_total:,}")
+    print(f"Log-loss          = {baseline_loss:.4f}")
+    print()
+
+    results: list[tuple[float, float, float, int, float, int]] = []
+
+    for k in k_grid:
+        for k_provisional in k_provisional_grid:
+            for provisional_matches in provisional_matches_grid:
+                for half_life in half_life_grid:
+                    if k_provisional < k:
+                        continue
+
+                    loss, eligible, _ = evaluate_params(
+                        validation_rows,
+                        base,
+                        k,
+                        k_provisional,
+                        int(provisional_matches),
+                        half_life,
+                        as_of,
+                        train_rows,
+                    )
+
+                    results.append((loss, k, k_provisional, int(provisional_matches), half_life, eligible))
+
+    if not results:
+        print("No valid parameter combinations found.")
+        return
+
+    results.sort(key=lambda result: result[0])
+
+    print("Log-loss      K  K-prov  Prov-N  Half-Life   Eligible (scored on: validation)")
+    print("-" * 76)
+
+    for loss, k, k_provisional, provisional_matches, half_life, eligible in results[:10]:
+        half_life_display = "off" if half_life <= 0 else f"{half_life:g}"
+
+        print(
+            f"{loss:>8.4f} "
+            f"{k:>5g} "
+            f"{k_provisional:>7g} "
+            f"{provisional_matches:>7d} "
+            f"{half_life_display:>10} "
+            f"{eligible:>10,}"
+        )
+
+    best = results[0]
+
+    absolute_change = baseline_loss - best[0]
+    relative_change = (absolute_change / baseline_loss) * 100 if baseline_loss else float("nan")
+
+    print()
+    print("Best configuration:")
+    print(f"--k {best[1]:g} --k-provisional {best[2]:g} --provisional-matches {best[3]} --half-life {best[4]:g}")
+    print(f"Eligible validation matches = {best[5]:,}")
+    print(f"Log-loss = {best[0]:.4f}")
+
+    print()
+    print("Comparison:")
+    print(f"Baseline log-loss:  {baseline_loss:.4f}")
+    print(f"Best log-loss:      {best[0]:.4f}")
+    print(f"Absolute change:    +{absolute_change:.4f}")
+    print(f"Relative change:    +{relative_change:.2f}%")
+    print(f"Result: {'IMPROVEMENT' if best[0] < baseline_loss else 'NO IMPROVEMENT'}")
+
+
+# =========================
+# THREE-WAY TEST
+# =========================
+
+def print_model_results(label: str, k: float, k_provisional: float, provisional_matches: int, loss: float, eligible: int, total: int) -> None:
+    print(label)
+    print(f"K:                 {k:g}")
+    print(f"K-provisional:     {k_provisional:g}")
+    print(f"Provisional:       {provisional_matches}")
+    print(f"Eligible matches:  {eligible:,} / {total:,}")
+    print(f"Log-loss:          {loss:.4f}")
+
+
+def three_way_test(rows: list[dict[str, str]], base: float, as_of: date) -> None:
+    train_rows, validation_rows, test_rows = three_way_split(rows)
+
+    print()
+    print(f"Training:   {len(train_rows):,} matches")
+    print(f"Validation: {len(validation_rows):,} matches")
+    print(f"Test:       {len(test_rows):,} matches")
+    print()
+    print("Player IDs normalized with MERGE_MAP.")
+    print(f"Blacklisted IDs removed: {BLACKLIST}")
+    print(f"Activity requirement: 1 match within {ACTIVITY_WINDOW_DAYS} days")
+    print()
+    print("The test set is NOT used to choose parameters.")
+    print()
+    print("---")
+    print()
+    print("VALIDATION")
+    print()
+
+    baseline_validation_loss, baseline_validation_eligible, baseline_validation_total = evaluate_params(
+        validation_rows,
+        base,
+        BASELINE_K,
+        BASELINE_K_PROVISIONAL,
+        BASELINE_PROVISIONAL_MATCHES,
+        BASELINE_HALF_LIFE,
+        as_of,
+        train_rows,
     )
 
-    # =========================
-    # TABLE HEADER
-    # =========================
-
-    header_y = 0.885
-
-    ax.text(0.065, header_y, "RANK", fontsize=11, fontweight="bold")
-    ax.text(0.135, header_y, "PLAYER", fontsize=11, fontweight="bold")
-    ax.text(0.690, header_y, "RATING", fontsize=11, fontweight="bold", ha="right")
-    ax.text(0.785, header_y, "MATCHES", fontsize=11, fontweight="bold", ha="right")
-    ax.text(0.865, header_y, "W", fontsize=11, fontweight="bold", ha="right")
-    ax.text(0.915, header_y, "L", fontsize=11, fontweight="bold", ha="right")
-
-    ax.plot(
-        [0.055, 0.945],
-        [0.865, 0.865],
-        linewidth=1.5,
+    optimized_validation_loss, optimized_validation_eligible, optimized_validation_total = evaluate_params(
+        validation_rows,
+        base,
+        OPTIMIZED_K,
+        OPTIMIZED_K_PROVISIONAL,
+        OPTIMIZED_PROVISIONAL_MATCHES,
+        OPTIMIZED_HALF_LIFE,
+        as_of,
+        train_rows,
     )
 
-    # =========================
-    # ROWS
-    # =========================
+    print_model_results(
+        "Baseline",
+        BASELINE_K,
+        BASELINE_K_PROVISIONAL,
+        BASELINE_PROVISIONAL_MATCHES,
+        baseline_validation_loss,
+        baseline_validation_eligible,
+        baseline_validation_total,
+    )
 
-    usable_height = 0.80
-    actual_row_height = usable_height / max(len(rows), 1)
-    actual_row_height = min(actual_row_height, row_height)
+    print()
 
-    # If there are lots of players, use the full height of the figure.
-    if len(rows) > 25:
-        top_y = 0.845
-        bottom_y = 0.065
-        actual_row_height = (top_y - bottom_y) / len(rows)
+    print_model_results(
+        "Optimized",
+        OPTIMIZED_K,
+        OPTIMIZED_K_PROVISIONAL,
+        OPTIMIZED_PROVISIONAL_MATCHES,
+        optimized_validation_loss,
+        optimized_validation_eligible,
+        optimized_validation_total,
+    )
+
+    print()
+    print("---")
+    print()
+    print("FINAL TEST")
+    print()
+
+    baseline_test_loss, baseline_test_eligible, baseline_test_total = evaluate_params(
+        test_rows,
+        base,
+        BASELINE_K,
+        BASELINE_K_PROVISIONAL,
+        BASELINE_PROVISIONAL_MATCHES,
+        BASELINE_HALF_LIFE,
+        as_of,
+        train_rows + validation_rows,
+    )
+
+    optimized_test_loss, optimized_test_eligible, optimized_test_total = evaluate_params(
+        test_rows,
+        base,
+        OPTIMIZED_K,
+        OPTIMIZED_K_PROVISIONAL,
+        OPTIMIZED_PROVISIONAL_MATCHES,
+        OPTIMIZED_HALF_LIFE,
+        as_of,
+        train_rows + validation_rows,
+    )
+
+    print_model_results(
+        "Baseline:",
+        BASELINE_K,
+        BASELINE_K_PROVISIONAL,
+        BASELINE_PROVISIONAL_MATCHES,
+        baseline_test_loss,
+        baseline_test_eligible,
+        baseline_test_total,
+    )
+
+    print()
+
+    print_model_results(
+        "Optimized:",
+        OPTIMIZED_K,
+        OPTIMIZED_K_PROVISIONAL,
+        OPTIMIZED_PROVISIONAL_MATCHES,
+        optimized_test_loss,
+        optimized_test_eligible,
+        optimized_test_total,
+    )
+
+    absolute_improvement = baseline_test_loss - optimized_test_loss
+    relative_improvement = (absolute_improvement / baseline_test_loss) * 100 if baseline_test_loss else float("nan")
+
+    print()
+    print(f"Baseline log-loss:   {baseline_test_loss:.4f}")
+    print(f"Optimized log-loss:  {optimized_test_loss:.4f}")
+    print(f"Absolute improvement:+{absolute_improvement:.4f}")
+    print(f"Relative improvement:+{relative_improvement:.2f}%")
+    print()
+
+    if optimized_test_loss < baseline_test_loss:
+        print("RESULT: OPTIMIZED MODEL WINS")
     else:
-        top_y = 0.835
-        actual_row_height = 0.0275
+        print("RESULT: BASELINE MODEL WINS")
 
-    for index, row in enumerate(rows):
-        y = top_y - index * actual_row_height
 
-        rank = int(row["rank"])
-        player = row["player"]
-        rating = float(row["rating"])
-        matches = int(row["matches"])
-        wins = int(row["wins"])
-        losses = int(row["losses"])
+# =========================
+# OUTPUT
+# =========================
 
-        # Alternating row backgrounds.
-        if index % 2 == 1:
-            ax.add_patch(
-                Rectangle(
-                    (0.055, y - actual_row_height / 2),
-                    0.89,
-                    actual_row_height,
-                    alpha=0.04,
-                    transform=ax.transAxes,
-                    clip_on=False,
-                )
+def write_ratings(
+    path: str,
+    ratings: dict[str, float],
+    records: dict[str, dict[str, int]],
+    names: dict[str, str],
+    rows: list[dict[str, str]],
+    as_of: date,
+) -> None:
+
+    eligible = eligible_player_ids(rows, as_of)
+
+    ordered = sorted(
+        (
+            (player_id, rating)
+            for player_id, rating in ratings.items()
+            if player_id in eligible
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+
+        writer.writerow(["rank", "id", "player", "rating", "matches", "wins", "losses"])
+
+        for rank, (player_id, rating) in enumerate(ordered, start=1):
+            record = records.get(player_id, new_record())
+
+            writer.writerow([
+                rank,
+                player_id,
+                names.get(player_id, player_id),
+                round(rating, 2),
+                record["matches"],
+                record["wins"],
+                record["losses"],
+            ])
+
+
+# =========================
+# MAIN
+# =========================
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Build Fulkrank Elo ratings from match history.")
+
+    parser.add_argument("--matches", "-m", required=True)
+    parser.add_argument("--k", type=float, default=OPTIMIZED_K)
+    parser.add_argument("--k-provisional", type=float, default=OPTIMIZED_K_PROVISIONAL)
+    parser.add_argument("--provisional-matches", type=int, default=OPTIMIZED_PROVISIONAL_MATCHES)
+    parser.add_argument("--base", type=float, default=1200.0)
+    parser.add_argument("--half-life", type=float, default=OPTIMIZED_HALF_LIFE)
+    parser.add_argument("--as-of")
+    parser.add_argument("--output", "-o")
+    parser.add_argument("--optimize", action="store_true")
+    parser.add_argument("--three-way-test", action="store_true")
+    parser.add_argument("--split", type=float, default=0.20)
+    parser.add_argument("--k-grid")
+    parser.add_argument("--k-provisional-grid")
+    parser.add_argument("--provisional-matches-grid")
+    parser.add_argument("--half-life-grid")
+
+    args = parser.parse_args(argv)
+
+    try:
+        rows, removed_blacklisted = load_matches(args.matches)
+
+        print(f"Loaded {len(rows):,} cleaned matches.")
+        print(f"Merge map entries: {len(MERGE_MAP)}")
+        print(f"Blacklisted IDs removed: {BLACKLIST}")
+
+        if not rows:
+            raise ValueError("No valid matches were loaded.")
+
+        if args.as_of:
+            as_of = parse_date(args.as_of)
+        else:
+            as_of = max(timestamp_to_date(row["Timestamp"]) for row in rows)
+
+        if args.three_way_test:
+            three_way_test(rows, args.base, as_of)
+            return 0
+
+        if args.optimize:
+            optimize(
+                rows,
+                args.base,
+                parse_grid(args.k_grid, [12, 16, 20, 24, 32, 40]),
+                parse_grid(args.k_provisional_grid, [40, 60, 80]),
+                parse_grid(args.provisional_matches_grid, [0, 10, 20, 30]),
+                parse_grid(args.half_life_grid, [0, 100, 365, 730]),
+                as_of,
+                args.split,
             )
 
-        # Scale text down for very large ranking lists.
-        if len(rows) <= 50:
-            font_size = 11.5
-        elif len(rows) <= 100:
-            font_size = 9.5
-        elif len(rows) <= 200:
-            font_size = 7.5
-        else:
-            font_size = 6
+            return 0
 
-        # Special treatment for top three.
-        if rank == 1:
-            rank_size = font_size + 5
-            rank_weight = "bold"
-        elif rank == 2:
-            rank_size = font_size + 3
-            rank_weight = "bold"
-        elif rank == 3:
-            rank_size = font_size + 2
-            rank_weight = "bold"
-        else:
-            rank_size = font_size
-            rank_weight = "normal"
+        ratings: dict[str, float] = {}
+        records: dict[str, dict[str, int]] = {}
+        names: dict[str, str] = {}
 
-        ax.text(
-            0.065,
-            y,
-            str(rank),
-            fontsize=rank_size,
-            fontweight=rank_weight,
-            va="center",
+        apply_matches(
+            rows,
+            ratings,
+            records,
+            args.k,
+            args.base,
+            args.k_provisional,
+            args.provisional_matches,
+            args.half_life,
+            as_of,
+            names=names,
         )
 
-        ax.text(
-            0.135,
-            y,
-            player,
-            fontsize=font_size + 1 if rank <= 3 else font_size,
-            fontweight="bold" if rank <= 3 else "normal",
-            va="center",
-        )
+        if args.output:
+            write_ratings(
+                args.output,
+                ratings,
+                records,
+                names,
+                rows,
+                as_of,
+            )
 
-        ax.text(
-            0.690,
-            y,
-            f"{rating:.0f}",
-            fontsize=font_size + 1 if rank <= 3 else font_size,
-            fontweight="bold" if rank <= 3 else "normal",
-            ha="right",
-            va="center",
-        )
+            print(f"Ratings written to {args.output}")
 
-        ax.text(
-            0.785,
-            y,
-            f"{matches:,}",
-            fontsize=font_size,
-            ha="right",
-            va="center",
-        )
+        return 0
 
-        ax.text(
-            0.865,
-            y,
-            f"{wins:,}",
-            fontsize=font_size,
-            ha="right",
-            va="center",
-        )
-
-        ax.text(
-            0.915,
-            y,
-            f"{losses:,}",
-            fontsize=font_size,
-            ha="right",
-            va="center",
-        )
-
-    # =========================
-    # FOOTER
-    # =========================
-
-    ax.plot(
-        [0.055, 0.945],
-        [0.035, 0.035],
-        linewidth=1,
-    )
-
-    ax.text(
-        0.055,
-        0.015,
-        "Elo-based rankings • Active players only",
-        fontsize=10,
-        va="center",
-    )
-
-    ax.text(
-        0.945,
-        0.015,
-        "Fulkrank",
-        fontsize=10,
-        ha="right",
-        va="center",
-    )
-
-    fig.savefig(
-        output,
-        dpi=100,
-        bbox_inches="tight",
-        pad_inches=0,
-    )
-
-    plt.close(fig)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Generate a Fulkrank leaderboard graphic."
-    )
-
-    parser.add_argument(
-        "--input",
-        "-i",
-        default="rankings.csv",
-    )
-
-    parser.add_argument(
-        "--output",
-        "-o",
-        default="rankings.png",
-    )
-
-    parser.add_argument(
-        "--top",
-        "-n",
-        type=int,
-        default=None,
-        help="Only show the top N players. Default: all players.",
-    )
-
-    args = parser.parse_args()
-
-    rows = load_rankings(args.input)
-
-    if not rows:
-        raise ValueError("rankings.csv contains no players.")
-
-    make_graphic(
-        rows,
-        args.output,
-        args.top,
-    )
-
-    print(f"Graphic written to {args.output}")
-    print(f"Players shown: {len(rows) if args.top is None else min(args.top, len(rows)):,}")
+    except (OSError, ValueError) as error:
+        print(f"Error: {error}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
