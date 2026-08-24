@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import os
 import glob
-import odds_ds
+import Fulkrank.odds.odds_ds as odds_ds
 
 def load_ranking(input_csv):
     df = pd.read_csv(input_csv)
