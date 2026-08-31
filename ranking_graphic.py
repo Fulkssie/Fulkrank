@@ -21,11 +21,27 @@ UTK_LIGHT_SMOKE = "#E5E5E5"
 UTK_ROW_DARK = "#4A4B4D"
 UTK_SMOKE = "#66676A"
 
+# UTC
+UTC_BLUE = "#00386b"
+UTC_GOLD = "#e0aa0f"
+
+# EAST TN
+EAST_TN_PINK = "#fe7bb3"
+EAST_TN_GREEN = "#507d50"
+EAST_TN_BLACK = "#354832"
+EAST_TN_GRAY = "#9a7f85"
+EAST_TN_PURPLE = "#ac3fd5"
+
 # Shared
 WHITE = "#FFFFFF"
 LIGHT_GRAY = "#D9DDE5"
 ROW_BLUE = "#07144F"
 SUBTLE_BLUE = "#0B1758"
+
+# Rank movement colors
+GREEN = "#38B000"
+RED = "#E63946"
+BLUE = "#3A86FF"
 
 
 # =========================
@@ -64,6 +80,28 @@ def get_color_scheme(color_scheme):
             "row_color": UTK_ROW_DARK,
             "subtle_color": UTK_SMOKE,
             "title": "KNOXVILLE",
+        }
+
+    if color_scheme == "UTC":
+        return {
+            "primary": UTC_GOLD,
+            "background": UTC_BLUE,
+            "text": WHITE,
+            "muted_text": LIGHT_GRAY,
+            "row_color": ROW_BLUE,
+            "subtle_color": SUBTLE_BLUE,
+            "title": "CHATT",
+        }
+
+    if color_scheme == "EAST":
+        return {
+            "primary": EAST_TN_GREEN,
+            "background": EAST_TN_PINK,
+            "text": EAST_TN_BLACK,
+            "muted_text": EAST_TN_GRAY,
+            "row_color": EAST_TN_PURPLE,
+            "subtle_color": SUBTLE_BLUE,
+            "title": "EAST TN",
         }
 
     raise ValueError("No Color Scheme Given")
@@ -278,6 +316,7 @@ def make_graphic(rows, output, color_scheme, top_n=None):
         matches = int(row["matches"])
         wins = int(row["wins"])
         losses = int(row["losses"])
+        diff = str(row.get("diff", "")).strip().lower()
 
         # =========================
         # ALTERNATING ROWS
@@ -289,8 +328,7 @@ def make_graphic(rows, output, color_scheme, top_n=None):
                 Rectangle(
                     (
                         0.055,
-                        y
-                        - actual_row_height / 2,
+                        y - actual_row_height / 2,
                     ),
                     0.89,
                     actual_row_height,
@@ -370,19 +408,91 @@ def make_graphic(rows, output, color_scheme, top_n=None):
         # PLAYER
         # =========================
 
-        ax.text(
+        player_font_size = (
+            font_size + 1
+            if rank <= 3
+            else font_size
+        )
+
+        player_text = ax.text(
             0.135,
             y,
             player,
-            fontsize=(
-                font_size + 1
-                if rank <= 3
-                else font_size
-            ),
+            fontsize=player_font_size,
             fontweight=player_weight,
             color=TEXT,
             va="center",
         )
+
+        # =========================
+        # RANK CHANGE INDICATOR
+        # =========================
+
+        # Draw the canvas so we can accurately determine
+        # where the player's name ends.
+        fig.canvas.draw()
+
+        player_bbox = player_text.get_window_extent(
+            renderer=fig.canvas.get_renderer()
+        )
+
+        # Convert the right edge of the player name from
+        # display coordinates back into axes coordinates.
+        indicator_x = ax.transAxes.inverted().transform(
+            (player_bbox.x1, player_bbox.y1)
+        )[0] + 0.008
+
+        # Positive movement: +3 -> green ▲ 3
+        if diff.startswith("+"):
+
+            try:
+                movement = int(diff)
+
+                ax.text(
+                    indicator_x,
+                    y,
+                    f"▲ {movement}",
+                    fontsize=font_size,
+                    fontweight="bold",
+                    color=GREEN,
+                    va="center",
+                )
+
+            except ValueError:
+                pass
+
+        # Negative movement: -3 -> red ▼ 3
+        elif diff.startswith("-"):
+
+            try:
+                movement = abs(int(diff))
+
+                ax.text(
+                    indicator_x,
+                    y,
+                    f"▼ {movement}",
+                    fontsize=font_size,
+                    fontweight="bold",
+                    color=RED,
+                    va="center",
+                )
+
+            except ValueError:
+                pass
+
+        # No movement: blue ●
+        elif diff == "no":
+
+            ax.text(
+                indicator_x,
+                y,
+                "●",
+                fontsize=font_size * 0.8,
+                color=BLUE,
+                va="center",
+            )
+
+        # "new" intentionally displays nothing.
 
         # =========================
         # RATING
@@ -508,6 +618,10 @@ def main():
             "UTK",
             "etsu",
             "utk",
+            "UTC",
+            "utc",
+            "east",
+            "EAST"
         ],
         default="UTK",
         help=(
