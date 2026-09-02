@@ -320,11 +320,22 @@ def write_dataset(path: str, rows: list[dict]) -> None:
 # SCRAPER
 # =========================
 
-async def scrape_tournaments(tournament_file: str) -> list[dict]:
+async def scrape_tournaments(tournament_files: list[str]) -> list[dict]:
 
-    tournament_urls = load_tournament_urls(tournament_file)
+    tournament_urls = []
 
-    print(f"Loaded {len(tournament_urls)} tournaments")
+    for tournament_file in tournament_files:
+        urls = load_tournament_urls(tournament_file)
+        tournament_urls.extend(urls)
+
+    print(
+        f"Loaded {len(urls)} tournaments from {tournament_file}"
+    )
+
+    tournament_urls = list(dict.fromkeys(tournament_urls))
+
+    print()
+    print(f"Loaded {len(tournament_urls)} unique tournaments/events total")
 
     all_rows = []
 
@@ -339,7 +350,7 @@ async def scrape_tournaments(tournament_file: str) -> list[dict]:
 
             event_slug, tournament_slug = parse_slug(tournament_url)
 
-            if (event_slug is None or tournament_slug is None):
+            if event_slug is None or tournament_slug is None:
                 print("Skipping: Invalid slug")
                 continue
 
@@ -374,7 +385,6 @@ async def scrape_tournaments(tournament_file: str) -> list[dict]:
             all_rows.extend(converted_sets)
 
             print(f"Successfully added {len(converted_sets)} sets")
-            print()
 
             await asyncio.sleep(2)
 
@@ -391,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--tournaments",
         "-t",
+        nargs="+",
         required=True,
     )
 

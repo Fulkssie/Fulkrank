@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 
 from datetime import date, datetime, timedelta, timezone
 from math import log
@@ -65,7 +66,7 @@ BASELINE_PROVISIONAL_MATCHES = 20
 BASELINE_HALF_LIFE = 0.0
 
 OPTIMIZED_K = 32.0
-OPTIMIZED_K_PROVISIONAL = 400.0
+OPTIMIZED_K_PROVISIONAL = 200.0
 OPTIMIZED_PROVISIONAL_MATCHES = 5
 OPTIMIZED_HALF_LIFE = 0.0
 
@@ -1339,6 +1340,24 @@ def write_ratings(
     min_matches: int,
 ) -> None:
 
+    previous_ranks: dict[str, int] = {}
+
+    if os.path.exists(path):
+
+        with open(path, newline="", encoding="utf-8") as handle:
+
+            reader = csv.DictReader(handle)
+
+            for row in reader:
+
+                try:
+
+                    previous_ranks[row["id"]] = int(row["rank"])
+
+                except (KeyError, ValueError):
+
+                    continue
+
     eligible = ranked_player_ids(
         rows,
         records,
@@ -1356,17 +1375,13 @@ def write_ratings(
         reverse=True,
     )
 
-    with open(
-        path,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as handle:
+    with open(path, "w", newline="", encoding="utf-8") as handle:
 
         writer = csv.writer(handle)
 
         writer.writerow([
             "rank",
+            "diff",
             "id",
             "player",
             "rating",
@@ -1375,23 +1390,37 @@ def write_ratings(
             "losses",
         ])
 
-        for rank, (player_id, rating) in enumerate(
-            ordered,
-            start=1,
-        ):
+        for rank, (player_id, rating) in enumerate(ordered, start=1):
 
-            record = records.get(
-                player_id,
-                new_record(),
-            )
+            record = records.get(player_id, new_record())
+
+            previous_rank = previous_ranks.get(player_id)
+
+            if previous_rank is None:
+
+                diff = "new"
+
+            else:
+
+                change = previous_rank - rank
+
+                if change > 0:
+
+                    diff = f"+{change}"
+
+                elif change < 0:
+
+                    diff = str(change)
+
+                else:
+
+                    diff = "no"
 
             writer.writerow([
                 rank,
+                diff,
                 player_id,
-                names.get(
-                    player_id,
-                    player_id,
-                ),
+                names.get(player_id, player_id),
                 round(rating, 2),
                 record["matches"],
                 record["wins"],
